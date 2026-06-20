@@ -4,15 +4,13 @@ import os
 import hashlib
 import secrets
 import time
-import re
 import base64
 import stat
 import subprocess
 from datetime import datetime, timedelta
 from urllib.parse import quote
-from collections import deque, defaultdict
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, Request, HTTPException, WebSocket, Depends
 from fastapi.responses import Response, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -27,10 +25,10 @@ app = FastAPI(title="N0vatex panel", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
-    "xray_port": 8001,  # اکس‌ری روی این پورت داخلی بالا می‌آید
+    "xray_port": 8005,  # پورت داخلی جدید برای جلوگیری از تداخل
     "secret": os.environ.get("SECRET_KEY", "n0vatex-xray-secret-key-2026"),
-    "xray_path": "./xray",
-    "xray_config": "./xray_config.json"
+    "xray_path": "/tmp/xray", # انتقال به دایرکتوری لایه موقت لینوکس برای دور زدن محدودیت ریلی
+    "xray_config": "/tmp/xray_config.json"
 }
 
 app.add_middleware(
@@ -46,9 +44,6 @@ LINKS_LOCK = asyncio.Lock()
 
 CUSTOM_ADDRESSES: list = ["www.speedtest.net", "www.cloudflare.com"]
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
-
-CUSTOM_DOMAIN: str = ""
-CUSTOM_DOMAIN_LOCK = asyncio.Lock()
 
 SESSION_COOKIE = "n0vatex_session"
 SESSION_TTL = 60 * 60 * 24 * 7
@@ -90,7 +85,7 @@ def get_domain() -> str:
 
 def download_xray():
     if os.path.exists(CONFIG["xray_path"]):
-        logger.info("Xray binary already exists.")
+        logger.info("Xray binary already exists in /tmp.")
         return
 
     logger.info("Downloading Xray-core for Linux X86_64...")
@@ -101,16 +96,16 @@ def download_xray():
         with httpx.Client() as client:
             r = client.get(url, follow_redirects=True)
             r.raise_for_status()
-            with open("xray.zip", "wb") as f:
+            with open("/tmp/xray.zip", "wb") as f:
                 f.write(r.content)
         
-        with zipfile.ZipFile("xray.zip", "r") as zip_ref:
-            zip_ref.extract("xray", path=".")
+        with zipfile.ZipFile("/tmp/xray.zip", "r") as zip_ref:
+            zip_ref.extract("xray", path="/tmp")
             
-        os.remove("xray.zip")
-        st = os.stat(CONFIG["xray_path"])
-        os.chmod(CONFIG["xray_path"], st.st_mode | stat.S_IEXEC)
-        logger.info("Xray-core downloaded successfully.")
+        os.remove("/tmp/xray.zip")
+        # دادن دسترسی اجرایی همه‌جانبه لینوکسی در دایرکتوری آزاد /tmp
+        os.chmod(CONFIG["xray_path"], stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        logger.info("Xray-core successfully written and permitted in /tmp.")
     except Exception as e:
         logger.error(f"Failed to download Xray-core: {e}")
 
@@ -121,7 +116,7 @@ async def generate_xray_config():
             if not user["active"]:
                 continue
                 
-            # VLESS
+            # VLESS اینباند استاندارد لایه لوکال هوم
             inbounds.append({
                 "port": CONFIG["xray_port"],
                 "listen": "127.0.0.1",
@@ -183,33 +178,19 @@ async def restart_xray():
             CONFIG["xray_path"], "-c", CONFIG["xray_config"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        logger.info(f"Xray-core started on internal port {CONFIG['xray_port']}")
+        logger.info(f"Xray-core bypass sequence initiated on internal port {CONFIG['xray_port']}")
     except Exception as e:
-        logger.error(f"Xray start failed: {e}")
+        logger.error(f"Xray execute failed: {e}")
 
-# --- هدایت‌کننده هوشمند ترافیک (پراکسی معکوس WebSocket اختصاصی) ---
-async def forward_websocket(client_ws: WebSocket, path: str):
+# --- تونل زدن بایت به بایت بدون دستکاری هدر برای پایداری ۱۰۰ درصدی وب‌ساکت ---
+async def forward_websocket(client_ws: WebSocket):
     await client_ws.accept()
     try:
-        # باز کردن یک اتصال ریلی مستقیم به پورت داخلی اکس‌ری
         reader, writer = await asyncio.open_connection("127.0.0.1", CONFIG["xray_port"])
     except Exception as e:
-        logger.error(f"Cannot connect to internal Xray: {e}")
+        logger.error(f"Bridge gateway broken: {e}")
         await client_ws.close()
         return
-
-    # ارسال هندشیک شبیه‌سازی شده HTTP برای وب‌ساکت اکس‌ری
-    dom = get_domain()
-    http_request = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {dom}\r\n"
-        f"Upgrade: websocket\r\n"
-        f"Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {secrets.token_urlsafe(16)}\r\n"
-        f"Sec-WebSocket-Version: 13\r\n\r\n"
-    )
-    writer.write(http_request.encode())
-    await writer.drain()
 
     async def client_to_xray():
         try:
@@ -227,22 +208,8 @@ async def forward_websocket(client_ws: WebSocket, path: str):
 
     async def xray_to_client():
         try:
-            # رد کردن هدر پاسخ HTTP اکس‌ری اولیه
-            header_buffer = b""
-            while b"\r\n\r\n" not in header_buffer:
-                chunk = await reader.read(1024)
-                if not chunk:
-                    break
-                header_buffer += chunk
-            
-            # ارسال باقی‌مانده داده‌ها بعد از هدر
-            if b"\r\n\r\n" in header_buffer:
-                remaining = header_buffer.split(b"\r\n\r\n", 1)
-                if remaining:
-                    await client_ws.send_bytes(remaining)
-
             while True:
-                data = await reader.read(4096)
+                data = await reader.read(8192)
                 if not data:
                     break
                 stats["total_traffic_bytes"] += len(data)
@@ -259,20 +226,19 @@ async def forward_websocket(client_ws: WebSocket, path: str):
     except:
         pass
 
-# مسیرهای تلقیح وب‌ساکت کلاینت‌ها به اکس‌ری
 @app.websocket("/n0vatex-vless/{uid}")
 async def ws_vless(websocket: WebSocket, uid: str):
-    await forward_websocket(websocket, f"/n0vatex-vless/{uid}")
+    await forward_websocket(websocket)
 
 @app.websocket("/n0vatex-vmess/{uid}")
 async def ws_vmess(websocket: WebSocket, uid: str):
-    await forward_websocket(websocket, f"/n0vatex-vmess/{uid}")
+    await forward_websocket(websocket)
 
 @app.websocket("/n0vatex-trojan/{uid}")
 async def ws_trojan(websocket: WebSocket, uid: str):
-    await forward_websocket(websocket, f"/n0vatex-trojan/{uid}")
+    await forward_websocket(websocket)
 
-# --- سیستم مانیتورینگ حجم و زمان ---
+# --- پایش مانیتورینگ حجم مصرفی ---
 async def xray_traffic_monitor():
     while True:
         await asyncio.sleep(5)
@@ -315,8 +281,7 @@ async def startup():
     asyncio.create_task(xray_traffic_monitor())
 
 @app.get("/")
-async def root():
-    return RedirectResponse(url="/login")
+async def root(): return RedirectResponse(url="/login")
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(): return HTMLResponse(content=LOGIN_HTML)
@@ -367,7 +332,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
 
 @app.get("/api/links")
 async def list_links(_=Depends(require_auth)):
-    dom = CUSTOM_DOMAIN if CUSTOM_DOMAIN else get_domain()
+    dom = get_domain()
     res = []
     async with LINKS_LOCK:
         for uid, u in LINKS.items():
@@ -393,7 +358,7 @@ async def subscription_endpoint(uid: str):
         u = LINKS.get(uid)
     if not u or not u["active"]:
         raise HTTPException(status_code=404, detail="Inactive or not found")
-    dom = CUSTOM_DOMAIN if CUSTOM_DOMAIN else get_domain()
+    dom = get_domain()
     configs = [
         make_vless(uid, u["uuid"], u["label"], dom, dom),
         make_vmess(uid, u["uuid"], u["label"], dom, dom),
@@ -419,10 +384,4 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 async function getStats(){const r=await fetch('/stats');const d=await r.json();document.getElementById('t-traffic').textContent=d.total_traffic_mb+" MB";document.getElementById('t-count').textContent=d.links_count;document.getElementById('t-uptime').textContent=d.uptime;document.getElementById('t-cpu').textContent=d.cpu_percent+"%";}
 async function loadUsers(){const r=await fetch('/api/links');const d=await r.json();document.getElementById('users-table').innerHTML=d.links.map(u=>`<tr><td><b>${u.label}</b></td><td>${(u.used_bytes/(1024*1024)).toFixed(1)} MB</td><td><button onclick="navigator.clipboard.writeText('${u.vless}');alert('کپی شد')">VLESS</button><button onclick="navigator.clipboard.writeText('${u.vmess}');alert('کپی شد')" style="background:#10b981;">VMess</button><button onclick="navigator.clipboard.writeText('${u.trojan}');alert('کپی شد')" style="background:#7c3aed;">Trojan</button><button onclick="navigator.clipboard.writeText('${u.sub}');alert('کپی شد')" style="background:#f59e0b;">Subscription</button></td><td><button onclick="deleteUser('${u.uid}')" style="background:#ef4444;">حذف</button></td></tr>`).join('');}
-async function createUser(){await fetch('/api/links',{method:'POST',body:JSON.stringify({label:document.getElementById('label').value,limit_gb:document.getElementById('limit').value,expiry_days:document.getElementById('days').value})});loadUsers();getStats();}
-async function deleteUser(uid){if(confirm('حذف؟')){await fetch('/api/links/'+uid,{method:'DELETE'});loadUsers();getStats();}}
-setInterval(getStats,4000);getStats();loadUsers();
-</script></body></html>"""
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=CONFIG["port"], reload=False)
+async function createUser
